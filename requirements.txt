@@ -1,0 +1,4 @@
+google-genai
+requests
+edge-tts
+git+https://github.com/K07VN/capcut-tts-api.git
