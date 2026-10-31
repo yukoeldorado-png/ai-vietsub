@@ -15,16 +15,21 @@ CONFIG = {
     "voice": "CapCut - Nguồn Nhỏ Ngọt Ngào (BV421)",
     "font_family": "Comfortaa",
     "font_size": 16,
-    "default_y1": 0.89,
-    "default_y2": 0.97
+    "default_y1": 0.84,
+    "default_y2": 0.98
 }
 
+# PROMPT TỰ NHIÊN CHUẨN GOOGLE AI STUDIO (KHÔNG ÉP ĐẾM TỪ, KHÔNG GÂY LỆCH GIÂY)
 YAN_BASE_INSTRUCTIONS = """
-Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa phim hoạt hình Trung Quốc.
-TỐI HẬU THƯ:
-1. Mỗi entry phụ đề BẮT BUỘC chỉ được nằm trên DUY NHẤT 1 DÒNG ĐƠN (tối đa 10-12 từ).
-2. Định dạng bắt buộc: 00:mm:ss,mmm --> 00:mm:ss,mmm (LUÔN CÓ ĐỦ 00: Ở CẢ 2 ĐẦU).
-3. Tuyệt đối cách nhau bởi 1 dòng trống. CẤM DẤU NGOẶC KÉP ("). Không xuất lời dẫn.
+Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa hoạt hình Trung Quốc sang tiếng Việt.
+
+YÊU CẦU:
+1. Dịch chuẩn xác toàn bộ lời thoại và phụ đề của video sang tiếng Việt theo định dạng chuẩn SRT (SubRip).
+2. Căn mốc thời gian (00:mm:ss,mmm --> 00:mm:ss,mmm) bám sát tuyệt đối theo giọng nói của nhân vật và phụ đề tiếng Trung trên màn hình.
+3. Giữ nguyên cấu trúc tự nhiên của từng câu thoại theo đúng nhịp thở nhân vật, không tự ý ngắt đôi câu làm hỏng mốc thời gian.
+4. ĐỊNH DẠNG:
+   - Mỗi entry phụ đề gồm số thứ tự, mốc thời gian và lời dịch trên 1 dòng đơn.
+   - Giữa các entry cách nhau bởi đúng 1 dòng trống. Không dùng dấu ngoặc kép ("), không thêm lời dẫn.
 """
 
 CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -50,6 +55,17 @@ def get_audio_duration(file_path: str) -> float:
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
     try: return float(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout.strip())
     except: return 2.0
+
+def convert_to_cfr_30fps(input_path: str, output_path: str = "cfr_standard.mp4") -> str:
+    print("[*] Khóa cứng chuẩn 30fps CFR để giữ nhịp khung hình ổn định...")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-r", "30", "-vsync", "cfr",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:a", "aac", output_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return output_path if os.path.exists(output_path) else input_path
 
 def clean_timestamp_str(t: str) -> str:
     t = t.strip().replace('.', ',')
@@ -86,7 +102,8 @@ def parse_srt(srt_file: str):
         items.append((start, end, m.group(4).strip().replace('\n', ' ')))
     return items
 
-def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], output_srt: str = "temp_sub.srt"):
+# CHẠY 1 LẦN NGUYÊN BẢN CẢ VIDEO (KHÔNG CẮT KHÚC)
+def get_srt_from_gemini_natural(video_path: str, model_list=CONFIG["models"], output_srt: str = "temp_sub.srt"):
     safe_video_path = "upload_for_gemini.mp4"
     shutil.copyfile(video_path, safe_video_path)
     v_file = client.files.upload(file=safe_video_path)
@@ -97,11 +114,13 @@ def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], outpu
 
     config = types.GenerateContentConfig(system_instruction=YAN_BASE_INSTRUCTIONS, temperature=0.1)
     resp = None
+    prompt_req = "Hãy nghe lời thoại và dịch phụ đề tiếng Trung trong video sang phụ đề tiếng Việt chuẩn định dạng SRT. Căn chuẩn mốc thời gian bắt đầu và kết thúc của từng câu thoại."
+
     for model_name in model_list:
-        print(f"[*] Bóc sub với model: {model_name}...")
+        print(f"[*] Đang bóc sub tự nhiên với model: {model_name}...")
         for attempt in range(1, 4):
             try:
-                r = client.models.generate_content(model=model_name, contents=[v_file, "Xuất SRT 1 dòng chuẩn theo quy tắc."], config=config)
+                r = client.models.generate_content(model=model_name, contents=[v_file, prompt_req], config=config)
                 if r and r.text:
                     resp = r; print(f"[✓] Bóc sub thành công với {model_name}!"); break
             except Exception as e:
@@ -136,7 +155,10 @@ def detect_sub_zone_from_frame(video_path: str, timestamp_sec: float = 2.0, mode
         if len(nums) >= 2:
             y1, y2 = int(nums[0]) / 100.0, int(nums[1]) / 100.0
             y1, y2 = min(y1, y2), max(y1, y2)
-            if 0.70 <= y1 < y2 <= 1.0: return y1, y2
+            if 0.70 <= y1 < y2 <= 1.0:
+                y1_safe = max(0.75, y1 - 0.035)
+                y2_safe = min(1.0, y2 + 0.02)
+                return y1_safe, y2_safe
     except: pass
     return CONFIG["default_y1"], CONFIG["default_y2"]
 
@@ -172,9 +194,9 @@ def build_synced_tts_track(srt_file: str, voice_type: str, output_audio: str = "
         try:
             if generate_voice_file(text, voice_type, raw_p):
                 audio_dur = get_audio_duration(raw_p)
-                max_allowed_dur = max(0.5, end_sec - start_sec - 0.08)
+                max_allowed_dur = max(0.4, end_sec - start_sec - 0.03)
                 if audio_dur > max_allowed_dur:
-                    speed_factor = min(1.85, audio_dur / max_allowed_dur)
+                    speed_factor = min(2.0, audio_dur / max_allowed_dur)
                     subprocess.run(["ffmpeg", "-y", "-i", raw_p, "-filter:a", f"atempo={speed_factor:.2f}", "-vn", fit_p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     chosen_p = fit_p
                 else: chosen_p = raw_p
@@ -196,7 +218,7 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
     w, h = get_video_dimensions(input_video)
     y_start = (int(h * y1_pct) // 2) * 2
     crop_h = (int(h * (y2_pct - y1_pct)) // 2) * 2
-    crop_h = max(24, min(crop_h, h - y_start))
+    crop_h = max(36, min(crop_h, h - y_start))
 
     y_center_pct = (y1_pct + y2_pct) / 2.0
     center_margin_v = max(4, int((1.0 - y_center_pct) * 288 - (int(sub_fontsize) / 4)))
@@ -214,7 +236,7 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
 
     vf = (
         f"[0:v]split[m][c];"
-        f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
+        f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=26[b];"
         f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
         f"[v1]drawtext=text='sub - {t_sub}':x=25:y=25{font_org_cmd}:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
         f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
@@ -232,7 +254,7 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
 
 def clean_trash():
     shutil.rmtree("temp_tts", ignore_errors=True)
-    for f in ["upload_for_gemini.mp4", "temp_sub.srt", "full_tts.wav", "sub_sample.jpg"]:
+    for f in ["upload_for_gemini.mp4", "temp_sub.srt", "full_tts.wav", "sub_sample.jpg", "cfr_standard.mp4"]:
         if os.path.exists(f): 
             try: os.remove(f)
             except: pass
@@ -264,10 +286,20 @@ def main():
         print(f"=======================================================")
 
         try:
-            srt_p, first_sec = get_srt_from_gemini_auto(video_path)
-            y1, y2 = detect_sub_zone_from_frame(video_path, first_sec, CONFIG["models"][0])
+            # 1. Chuẩn hoá CFR 30fps
+            cfr_video = convert_to_cfr_30fps(video_path)
+
+            # 2. Bóc sub 1 lần duy nhất toàn bộ video chuẩn tự nhiên AI Studio
+            srt_p, first_sec = get_srt_from_gemini_natural(cfr_video)
+
+            # 3. Dò toạ độ khung mờ
+            y1, y2 = detect_sub_zone_from_frame(cfr_video, first_sec, CONFIG["models"][0])
+
+            # 4. Tạo giọng đọc CapCut
             tts_p = build_synced_tts_track(srt_p, CONFIG["voice"])
-            render_final_video_auto(video_path, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1, y2)
+
+            # 5. Render video hoàn chỉnh
+            render_final_video_auto(cfr_video, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1, y2)
             print(f"[✓] HOÀN TẤT: {out_name}")
         except Exception as e:
             print(f"[❌] Lỗi khi xử lý {base_name}: {e}")
