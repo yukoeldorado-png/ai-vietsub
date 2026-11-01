@@ -1,23 +1,33 @@
-import os, re, time, json, asyncio, subprocess, requests, shutil, glob, traceback
-from PIL import Image, ImageDraw
+import os, re, time, json, asyncio, subprocess, requests, shutil, glob
 from google import genai
 from google.genai import types
 
-# 1. CẤU HÌNH
+# ================= CẤU HÌNH =================
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 if not GEMINI_KEY:
     raise Exception("Chưa cài GEMINI_API_KEY trong GitHub Secrets!")
 
 client = genai.Client(api_key=GEMINI_KEY)
 
-CHANNEL_SUB_NAME = "lão tổ AI"
+# 👉 SỬA TÊN KÊNH CỦA CẬU Ở ĐÂY:
+CHANNEL_SUB_NAME = "IYaN AI"
 
 CONFIG = {
     "models": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash"],
     "voice": "CapCut - Nguồn Nhỏ Ngọt Ngào (BV421)",
     "font_family": "Comfortaa",
-    "font_size": 16
+    "font_size": 16,
+    "default_y1": 0.89,
+    "default_y2": 0.97
 }
+
+YAN_BASE_INSTRUCTIONS = """
+Persona: YaN - Chuyên gia Biên dịch ngôn ngữ & Bản địa hóa phim hoạt hình Trung Quốc.
+TỐI HẬU THƯ:
+1. Mỗi entry phụ đề BẮT BUỘC chỉ được nằm trên DUY NHẤT 1 DÒNG ĐƠN (tối đa 10-12 từ).
+2. Định dạng bắt buộc: 00:mm:ss,mmm --> 00:mm:ss,mmm (LUÔN CÓ ĐỦ 00: Ở CẢ 2 ĐẦU).
+3. Tuyệt đối cách nhau bởi 1 dòng trống. CẤM DẤU NGOẶC KÉP ("). Không xuất lời dẫn.
+"""
 
 CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 if not os.path.exists(CJK_FONT):
@@ -43,200 +53,130 @@ def get_audio_duration(file_path: str) -> float:
     try: return float(subprocess.run(cmd, stdout=subprocess.PIPE, text=True).stdout.strip())
     except: return 2.0
 
-def sec_to_time_str(sec: float) -> str:
-    sec = max(0.0, sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
-    ms = int(round((s - int(s)) * 1000))
-    if ms >= 1000: ms = 999
-    return f"{h:02d}:{m:02d}:{int(s):02d},{ms:03d}"
+def clean_timestamp_str(t: str) -> str:
+    t = t.strip().replace('.', ',')
+    parts = t.split(':')
+    if len(parts) == 2: return f"00:{int(parts[0]):02d}:{parts[1]}"
+    elif len(parts) == 3: return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{parts[2]}"
+    return t
 
-# ==================== BƯỚC 1: DÒ TOẠ ĐỘ VÙNG PHỤ ĐỀ ====================
-def detect_sub_zone_dynamic(video_path: str, model_choice: str = "gemini-3.7-flash"):
-    print("[*] Đang tự động dò toạ độ thanh phụ đề của phim...")
-    total_dur = get_audio_duration(video_path)
-    sample_times = [total_dur * 0.2, total_dur * 0.5, total_dur * 0.8]
-    img_path = "sub_detect_sample.jpg"
-    target_m = model_choice.split(" ")[0].strip()
+def rebuild_pure_srt(raw_text: str) -> str:
+    pattern = r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}|\d{1,2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}|\d{1,2}:\d{2}[,\.]\d{1,3})'
+    matches = list(re.finditer(pattern, raw_text))
+    if not matches: return raw_text
+    entries = []
+    for i in range(len(matches)):
+        st = clean_timestamp_str(matches[i].group(1))
+        et = clean_timestamp_str(matches[i].group(2))
+        p1 = matches[i].end()
+        p2 = matches[i+1].start() if i + 1 < len(matches) else len(raw_text)
+        lines = [l.strip() for l in raw_text[p1:p2].split('\n') if l.strip()]
+        valid = [l for l in lines if not re.match(r'^\d+$', l) and '-->' not in l]
+        txt = " ".join(valid).replace('"', '').strip()
+        if txt: entries.append((st, et, txt))
+    return "\n\n".join([f"{idx}\n{s} --> {e}\n{t}" for idx, (s, e, t) in enumerate(entries, 1)])
 
-    for test_time in sample_times:
-        subprocess.run(["ffmpeg", "-y", "-ss", f"{test_time:.2f}", "-i", video_path, "-vframes", "1", img_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not os.path.exists(img_path): continue
+def parse_srt(srt_file: str):
+    items = []
+    if not os.path.exists(srt_file): return items
+    with open(srt_file, "r", encoding="utf-8") as f: content = f.read()
+    for m in re.finditer(r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n(.*?)(?=\n\n|\Z)', content, re.DOTALL):
+        h1, mn1, s1 = m.group(2).split(':'); s1, ms1 = s1.split(',')
+        h2, mn2, s2 = m.group(3).split(':'); s2, ms2 = s2.split(',')
+        start = int(h1)*3600 + int(mn1)*60 + int(s1) + int(ms1)/1000.0
+        end   = int(h2)*3600 + int(mn2)*60 + int(s2) + int(ms2)/1000.0
+        items.append((start, end, m.group(4).strip().replace('\n', ' ')))
+    return items
 
-        try:
-            with open(img_path, "rb") as f: img_bytes = f.read()
+def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], output_srt: str = "temp_sub.srt"):
+    safe_video_path = "upload_for_gemini.mp4"
+    shutil.copyfile(video_path, safe_video_path)
+    v_file = client.files.upload(file=safe_video_path)
+    while v_file.state.name == "PROCESSING":
+        time.sleep(2)
+        v_file = client.files.get(name=v_file.name)
+    if v_file.state.name != "ACTIVE": raise Exception("Gemini không đọc được video.")
 
-            prompt = (
-                "Nhìn vào ảnh này, tìm dòng chữ phụ đề tiếng Trung của nhân vật chạy ở nửa dưới màn hình. "
-                "Trả về định dạng JSON thuần túy có dạng: {\"found\": true, \"y_start\": 86, \"y_end\": 96} "
-                "với y_start và y_end là số nguyên phần trăm (0-100) tính từ đỉnh ảnh xuống."
-            )
-
-            config = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
-            res = client.models.generate_content(
-                model=target_m,
-                contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt],
-                config=config
-            )
-
-            data = json.loads(re.search(r'\{.*\}', res.text, re.DOTALL).group(0))
-            if data.get("found"):
-                y1 = int(data.get("y_start", 0))
-                y2 = int(data.get("y_end", 0))
-                if y1 > y2: y1, y2 = y2, y1
-                diff = y2 - y1
-                if 4 <= diff <= 20 and 50 <= y1 <= 96:
-                    y1_safe = max(0.50, (y1 - 2.0) / 100.0)
-                    y2_safe = min(1.0, (y2 + 2.0) / 100.0)
-                    print(f"[✓] Đã bắt trúng toạ độ phụ đề: {y1_safe*100:.1f}% -> {y2_safe*100:.1f}%")
-                    return y1_safe, y2_safe
-        except: pass
-
-    print("[!] Dùng toạ độ an toàn dự phòng: 85% -> 97%")
-    return 0.85, 0.97
-
-# ==================== BƯỚC 2: NGHE AUDIO ĐỂ BẮT TIMESTAMP ====================
-def get_audio_speech_intervals(video_path: str, model_choice: str = "gemini-3.7-flash"):
-    print("[*] Đang nghe dải âm thanh 16.000 Hz để trích xuất mốc câu nói...")
-    audio_wav = "audio_16k.wav"
-    subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "16000", "-ac", "1", audio_wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    a_file = client.files.upload(file=audio_wav)
-    while a_file.state.name == "PROCESSING":
-        time.sleep(1.5)
-        a_file = client.files.get(name=a_file.name)
-
-    prompt = """
-    Hãy nghe kỹ toàn bộ file âm thanh này.
-    Nhiệm vụ: Trích xuất chính xác thời điểm bắt đầu (start) và kết thúc (end) tính bằng giây của từng câu nói của nhân vật.
-    QUY TẮC: Tách nhỏ từng câu, ngắt ngay khi có khoảng ngừng dù ngắn. Tuyệt đối không gộp câu.
-    ĐỊNH DẠNG BẮT BUỘC: Chỉ trả về mảng JSON thuần túy có dạng:
-    [{"start": 0.5, "end": 2.2}, {"start": 2.5, "end": 4.1}]
-    """
-
-    config = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
-    target_m = model_choice.split(" ")[0].strip()
-    res = client.models.generate_content(model=target_m, contents=[a_file, prompt], config=config)
-
-    try: client.files.delete(name=a_file.name)
-    except: pass
-    if os.path.exists(audio_wav): os.remove(audio_wav)
-
-    raw_json = re.search(r'\[.*\]', res.text, re.DOTALL).group(0)
-    intervals = json.loads(raw_json)
-
-    valid_intervals = []
-    for item in intervals:
-        s = float(item.get("start", 0))
-        e = float(item.get("end", 0))
-        if e > s and (e - s) >= 0.3:
-            valid_intervals.append({"start": s, "end": e})
-
-    print(f"[✓] Đã bắt được {len(valid_intervals)} mốc câu nói từ âm thanh!")
-    return valid_intervals
-
-# ==================== BƯỚC 3: CHỤP TỪNG THANH CHỮ & GHÉP THÀNH FILMSTRIP ====================
-def build_composite_filmstrip(video_path: str, intervals, y1_pct: float, y2_pct: float):
-    w, h = get_video_dimensions(video_path)
-    crop_y = int(h * y1_pct)
-    crop_h = max(24, int(h * (y2_pct - y1_pct)))
-
-    os.makedirs("sub_crops", exist_ok=True)
-    crop_images = []
-
-    print(f"[*] Đang chụp {len(intervals)} thanh phụ đề tương ứng từng câu nói...")
-    for idx, item in enumerate(intervals):
-        mid_time = (item["start"] + item["end"]) / 2.0
-        crop_file = f"sub_crops/crop_{idx:03d}.jpg"
-
-        cmd = [
-            "ffmpeg", "-y", "-ss", f"{mid_time:.3f}", "-i", video_path,
-            "-vframes", "1",
-            "-vf", f"crop=iw:{crop_h}:0:{crop_y},scale=960:-1",
-            crop_file
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        if os.path.exists(crop_file):
+    config = types.GenerateContentConfig(system_instruction=YAN_BASE_INSTRUCTIONS, temperature=0.1)
+    resp = None
+    for model_name in model_list:
+        print(f"[*] Bóc sub với model: {model_name}...")
+        for attempt in range(1, 4):
             try:
-                img = Image.open(crop_file).convert("RGB")
-                crop_images.append(img)
-            except:
-                crop_images.append(Image.new("RGB", (960, 60), color=(0, 0, 0)))
-        else:
-            crop_images.append(Image.new("RGB", (960, 60), color=(0, 0, 0)))
+                r = client.models.generate_content(model=model_name, contents=[v_file, "Xuất SRT 1 dòng chuẩn theo quy tắc."], config=config)
+                if r and r.text:
+                    resp = r; print(f"[✓] Thành công bóc sub bằng {model_name}!"); break
+            except Exception as e:
+                print(f"[!] Thử lại model {model_name} ({e})")
+                time.sleep(3)
+        if resp: break
 
-    if not crop_images:
-        return None
+    try: client.files.delete(name=v_file.name)
+    except: pass
 
-    total_w = 960
-    each_h = crop_images[0].height if crop_images else 60
-    total_h = max(60, each_h * len(crop_images))
+    if not resp or not resp.text: raise Exception("Model Gemini quá tải!")
+    pure_srt = rebuild_pure_srt(resp.text)
+    with open(output_srt, "w", encoding="utf-8") as f: f.write(pure_srt)
 
-    filmstrip = Image.new("RGB", (total_w, total_h), color=(0, 0, 0))
-    draw = ImageDraw.Draw(filmstrip)
+    first_time_match = re.search(r'00:(\d{2}):(\d{2}),(\d{3})', pure_srt)
+    first_sec = 2.0
+    if first_time_match:
+        first_sec = int(first_time_match.group(1)) * 60 + int(first_time_match.group(2)) + 0.5
+    return output_srt, first_sec
 
-    for idx, img in enumerate(crop_images):
-        y_pos = idx * each_h
-        filmstrip.paste(img, (0, y_pos))
-        draw.text((10, y_pos + 5), f"[{idx}]", fill=(255, 255, 0))
+def detect_sub_zone_from_frame(video_path: str, timestamp_sec: float = 2.0, model_choice: str = "gemini-3.7-flash"):
+    img_path = "sub_sample.jpg"
+    subprocess.run(["ffmpeg", "-y", "-ss", str(timestamp_sec), "-i", video_path, "-vframes", "1", img_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.exists(img_path): return CONFIG["default_y1"], CONFIG["default_y2"]
+    try:
+        with open(img_path, "rb") as f: img_bytes = f.read()
+        res = client.models.generate_content(
+            model=model_choice,
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), "Hãy nhìn vào dòng chữ phụ đề tiếng Trung chạy dưới đáy ảnh. Báo chính xác 2 số phần trăm: y_start, y_end tính từ đỉnh ảnh xuống."]
+        ).text
+        nums = re.findall(r'\d+', res)
+        if len(nums) >= 2:
+            y1, y2 = int(nums[0]) / 100.0, int(nums[1]) / 100.0
+            y1, y2 = min(y1, y2), max(y1, y2)
+            if 0.70 <= y1 < y2 <= 1.0: return y1, y2
+    except: pass
+    return CONFIG["default_y1"], CONFIG["default_y2"]
 
-    filmstrip_path = "all_subtitles_filmstrip.jpg"
-    filmstrip.save(filmstrip_path, quality=85)
-    shutil.rmtree("sub_crops", ignore_errors=True)
-    return filmstrip_path
+def generate_voice_file(text: str, voice_type: str, out_p: str) -> bool:
+    import edge_tts
+    if "CapCut" in voice_type and capcut_client:
+        v_id = "BV421_vivn_streaming"
+        if "BV422" in voice_type: v_id = "BV422_vivn_streaming"
+        elif "BV701" in voice_type: v_id = "BV701_streaming"
+        for _ in range(3):
+            try:
+                res = capcut_client.generate_speech(text, voice=v_id, timeout=30)
+                capcut_client.download_tts_audio(res, out_p)
+                if os.path.exists(out_p) and os.path.getsize(out_p) > 0: return True
+            except: time.sleep(1)
 
-# ==================== BƯỚC 4: OCR & DỊCH TỪNG ẢNH ====================
-def ocr_and_translate_filmstrip(filmstrip_path: str, num_items: int, model_choice: str = "gemini-3.7-flash"):
-    print(f"[*] Đang gửi cuộn ảnh {num_items} dòng phụ đề cho Gemini OCR & dịch...")
-    with open(filmstrip_path, "rb") as f:
-        img_bytes = f.read()
+    v_code, pitch, rate = "vi-VN-HoaiMyNeural", "+16Hz", "+8%"
+    if "Nam Minh" in voice_type: v_code, pitch, rate = "vi-VN-NamMinhNeural", "-2Hz", "+6%"
+    try:
+        asyncio.run(edge_tts.Communicate(text, v_code, pitch=pitch, rate=rate).save(out_p))
+        return os.path.exists(out_p) and os.path.getsize(out_p) > 0
+    except: return False
 
-    prompt = f"""
-    Trong ảnh này có đúng {num_items} thanh chữ phụ đề tiếng Trung được đánh số từ [0] đến [{num_items-1}].
-    Nhiệm vụ:
-    1. Nhận diện chữ tiếng Trung trong từng thanh (OCR) và dịch sang tiếng Việt tự nhiên theo ngữ cảnh hoạt hình.
-    2. Nếu một thanh nào đó không có chữ hoặc chỉ có hình nền, hãy để chuỗi rỗng "".
-    3. Trả về đúng một mảng JSON thuần túy gồm {num_items} phần tử:
-    ["câu 0 dịch", "câu 1 dịch", ...]
-    """
-
-    config = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
-    target_m = model_choice.split(" ")[0].strip()
-    res = client.models.generate_content(
-        model=target_m,
-        contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt],
-        config=config
-    )
-
-    if os.path.exists(filmstrip_path): os.remove(filmstrip_path)
-    raw_json = re.search(r'\[.*\]', res.text, re.DOTALL).group(0)
-    translations = json.loads(raw_json)
-    print(f"[✓] Đã OCR & dịch xong {len(translations)} dòng phụ đề độc lập!")
-    return translations
-
-# ==================== BƯỚC 5: TẠO FILE SRT CHUẨN 1:1 ====================
-def build_strict_1to1_srt(intervals, translations, output_srt: str = "final_perfect.srt"):
-    count = min(len(intervals), len(translations))
-    srt_lines = []
-
-    valid_idx = 1
-    for i in range(count):
-        txt = translations[i].strip().replace('"', '').replace('\n', ' ')
-        if not txt: continue
-
-        s_str = sec_to_time_str(intervals[i]["start"])
-        e_str = sec_to_time_str(intervals[i]["end"])
-
-        srt_lines.append(f"{valid_idx}\n{s_str} --> {e_str}\n{txt}")
-        valid_idx += 1
-
-    final_text = "\n\n".join(srt_lines)
-    with open(output_srt, "w", encoding="utf-8") as f:
-        f.write(final_text)
-
-    print(f"[✓] Đã tạo file SRT hoàn hảo với {valid_idx - 1} entry (Tuyệt đối không gộp)!")
+def build_synced_tts_track(srt_file: str, voice_type: str, output_audio: str = "full_tts.wav"):
+    items = parse_srt(srt_file)
+    inputs, parts = [], []
+    os.makedirs("temp_tts", exist_ok=True)
+    idx = 0
+    for start_sec, end_sec, text in items:
+        if not text or text.startswith("["): continue
+        raw_p = f"temp_tts/raw_{idx}.mp3"
+        fit_p = f"temp_tts/fit_{idx}.mp3"
+        try:
+            if generate_voice_file(text, voice_type, raw_p):
+                audio_dur = get_audio_duration(raw_p)
+                max_allowed_dur = max(0.5, end_sec - start_sec - 0.08)
+                if audio_dur > max_allowed_dur:
+                    speed_factor = min(1.85, audio_dur / max_allowed_dur)ối không gộp)!")
     return output_srt
 
 # DỰ PHÒNG AN TOÀN: NẾU HYBRID LỖI THÌ TỰ ĐỘNG BÓC TRỰC TIẾP TỪ VIDEO
