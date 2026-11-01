@@ -2,14 +2,12 @@ import os, re, time, json, asyncio, subprocess, requests, shutil, glob
 from google import genai
 from google.genai import types
 
-# ================= CẤU HÌNH =================
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 if not GEMINI_KEY:
     raise Exception("Chưa cài GEMINI_API_KEY trong GitHub Secrets!")
 
 client = genai.Client(api_key=GEMINI_KEY)
 
-# 👉 SỬA TÊN KÊNH CỦA CẬU Ở ĐÂY:
 CHANNEL_SUB_NAME = "lão hạc AI"
 
 CONFIG = {
@@ -105,7 +103,7 @@ def get_srt_from_gemini_auto(video_path: str, model_list=CONFIG["models"], outpu
             try:
                 r = client.models.generate_content(model=model_name, contents=[v_file, "Xuất SRT 1 dòng chuẩn theo quy tắc."], config=config)
                 if r and r.text:
-                    resp = r; print(f"[✓] Thành công bóc sub bằng {model_name}!"); break
+                    resp = r; print(f"[✓] Bóc sub thành công với {model_name}!"); break
             except Exception as e:
                 print(f"[!] Thử lại model {model_name} ({e})")
                 time.sleep(3)
@@ -176,39 +174,110 @@ def build_synced_tts_track(srt_file: str, voice_type: str, output_audio: str = "
                 audio_dur = get_audio_duration(raw_p)
                 max_allowed_dur = max(0.5, end_sec - start_sec - 0.08)
                 if audio_dur > max_allowed_dur:
-                    speed_factor = min(1.85, audio_dur / max_allowed_dur)ối không gộp)!")
-    return output_srt
+                    speed_factor = min(1.85, audio_dur / max_allowed_dur)
+                    subprocess.run(["ffmpeg", "-y", "-i", raw_p, "-filter:a", f"atempo={speed_factor:.2f}", "-vn", fit_p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    chosen_p = fit_p
+                else: chosen_p = raw_p
 
-# DỰ PHÒNG AN TOÀN: NẾU HYBRID LỖI THÌ TỰ ĐỘNG BÓC TRỰC TIẾP TỪ VIDEO
-def fallback_get_srt_direct(video_path: str, model_choice: str = "gemini-3.7-flash", output_srt: str = "fallback.srt"):
-    print("[!] Chuyển sang cơ chế dự phòng: Bóc SRT trực tiếp từ video...")
-    safe_video_path = "upload_for_gemini.mp4"
-    shutil.copyfile(video_path, safe_video_path)
-    v_file = client.files.upload(file=safe_video_path)
-    while v_file.state.name == "PROCESSING":
-        time.sleep(2)
-        v_file = client.files.get(name=v_file.name)
+                inputs.extend(["-i", chosen_p])
+                d_ms = int(start_sec * 1000)
+                parts.append(f"[{idx}]adelay={d_ms}|{d_ms}[a{idx}];")
+                idx += 1
+        except: pass
 
-    instr = "Dịch toàn bộ lời thoại sang tiếng Việt theo chuẩn SRT. Mỗi entry 1 dòng đơn, cách nhau 1 dòng trống. Không dùng ngoặc kép."
-    config = types.GenerateContentConfig(system_instruction=instr, temperature=0.1)
-    target_m = model_choice.split(" ")[0].strip()
-    res = client.models.generate_content(model=target_m, contents=[v_file, "Xuất SRT chuẩn theo từng câu nói."], config=config)
+    if idx > 0:
+        chain = "".join([f"[a{i}]" for i in range(idx)])
+        fc = "".join(parts) + f"{chain}amix=inputs={idx}:dropout_transition=0:normalize=0[out]"
+        subprocess.run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[out]", output_audio], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return output_audio
+    return None
 
-    try: client.files.delete(name=v_file.name)
-    except: pass
-    if os.path.exists(safe_video_path): os.remove(safe_video_path)
+def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_name, y1_pct, y2_pct, sub_fontsize=16, font_family="Comfortaa"):
+    w, h = get_video_dimensions(input_video)
+    y_start = (int(h * y1_pct) // 2) * 2
+    crop_h = (int(h * (y2_pct - y1_pct)) // 2) * 2
+    crop_h = max(24, min(crop_h, h - y_start))
 
-    with open(output_srt, "w", encoding="utf-8") as f:
-        f.write(res.text)
-    return output_srt
+    y_center_pct = (y1_pct + y2_pct) / 2.0
+    center_margin_v = max(4, int((1.0 - y_center_pct) * 288 - (int(sub_fontsize) / 4)))
 
-def parse_srt(srt_file: str):
-    items = []
-    if not os.path.exists(srt_file): return items
-    with open(srt_file, "r", encoding="utf-8") as f: content = f.read()
-    for m in re.finditer(r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n(.*?)(?=\n\n|\Z)', content, re.DOTALL):
-        h1, mn1, s1 = m.group(2).split(':'); s1, ms1 = s1.split(',')
-        h2, mn2, s2 = m.group(3).split(':'); s2, ms2 = s2.split(',')
+    t_sub = sub_name.replace("'", "").replace(":", " -")
+    srt_p = os.path.abspath(srt_file).replace("\\", "/")
+
+    items = parse_srt(srt_file)
+    en_list = [f"between(t,{max(0, s-0.08):.2f},{e+0.18:.2f})" for s, e, t in items if t]
+    en_str = "+".join(en_list) if en_list else "1"
+
+    font_name = "Comfortaa"
+    if "Roboto" in font_family: font_name = "Roboto"
+    font_org_cmd = f":fontfile='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
+
+    vf = (
+        f"[0:v]split[m][c];"
+        f"[c]crop=iw:{crop_h}:0:{y_start},gblur=sigma=15[b];"
+        f"[m][b]overlay=0:{y_start}:enable='{en_str}'[v1];"
+        f"[v1]drawtext=text='sub - {t_sub}':x=25:y=25{font_org_cmd}:fontcolor=white:shadowcolor=black:shadowx=1:shadowy=1,"
+        f"drawtext=text='{t_sub}':x='mod(t*65,w+tw)-tw':y='mod(t*32,h+th)-th':fontsize=20:fontcolor=white@0.10,"
+        f"subtitles=filename='{srt_p}':force_style='FontName={font_name},FontSize={int(sub_fontsize)},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2.0,Alignment=2,MarginV={center_margin_v}'[vout]"
+    )
+
+    if tts_audio and os.path.exists(tts_audio):
+        af = "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        cmd = ["ffmpeg", "-y", "-i", input_video, "-i", tts_audio, "-filter_complex", f"{vf};{af}", "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", output_final]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", input_video, "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", output_final]
+
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return output_final
+
+def clean_trash():
+    shutil.rmtree("temp_tts", ignore_errors=True)
+    for f in ["upload_for_gemini.mp4", "temp_sub.srt", "full_tts.wav", "sub_sample.jpg"]:
+        if os.path.exists(f): 
+            try: os.remove(f)
+            except: pass
+
+def main():
+    input_dir = "input_videos"
+    output_dir = "output_videos"
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw_files = []
+    for ext in ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.MP4", "*.MOV", "*.MKV"):
+        raw_files.extend(glob.glob(os.path.join(input_dir, ext)))
+
+    video_files = [f for f in raw_files if "_Vietsub" not in os.path.basename(f)]
+
+    if not video_files:
+        print("[!] Không tìm thấy video gốc nào cần xử lý!")
+        return
+
+    print(f"🚀 Tìm thấy tổng cộng {len(video_files)} video. Bắt đầu xử lý...")
+
+    for idx, video_path in enumerate(video_files, 1):
+        clean_trash()
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        out_name = os.path.join(output_dir, f"{base_name}_Vietsub.mp4")
+        print(f"\n=======================================================")
+        print(f"▶️ [{idx}/{len(video_files)}] Đang làm video: {base_name}")
+        print(f"=======================================================")
+
+        try:
+            srt_p, first_sec = get_srt_from_gemini_auto(video_path)
+            y1, y2 = detect_sub_zone_from_frame(video_path, first_sec, CONFIG["models"][0])
+            tts_p = build_synced_tts_track(srt_p, CONFIG["voice"])
+            render_final_video_auto(video_path, srt_p, tts_p, out_name, CHANNEL_SUB_NAME, y1, y2)
+            print(f"[✓] HOÀN TẤT: {out_name}")
+        except Exception as e:
+            print(f"[❌] Lỗi khi xử lý {base_name}: {e}")
+            print("⏩ Nhảy sang video tiếp theo...")
+        clean_trash()
+
+    print("\n🎉 ĐÃ XỬ LÝ XONG TẤT CẢ VIDEO!")
+
+if __name__ == "__main__":
+    main():'); s2, ms2 = s2.split(',')
         start = int(h1)*3600 + int(mn1)*60 + int(s1) + int(ms1)/1000.0
         end   = int(h2)*3600 + int(mn2)*60 + int(s2) + int(ms2)/1000.0
         items.append((start, end, m.group(4).strip().replace('\n', ' ')))
