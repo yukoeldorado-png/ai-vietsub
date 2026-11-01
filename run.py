@@ -2,6 +2,7 @@ import os, re, time, json, asyncio, subprocess, requests, shutil, glob
 from google import genai
 from google.genai import types
 
+# 1. CẤU HÌNH HỆ THỐNG
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 if not GEMINI_KEY:
     raise Exception("Chưa cài GEMINI_API_KEY trong GitHub Secrets!")
@@ -210,7 +211,7 @@ def render_final_video_auto(input_video, srt_file, tts_audio, output_final, sub_
 
     font_name = "Comfortaa"
     if "Roboto" in font_family: font_name = "Roboto"
-    font_org_cmd = f":fontfile='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
+    font_org_cmd = f":le='{CJK_FONT}'" if os.path.exists(CJK_FONT) else ""
 
     vf = (
         f"[0:v]split[m][c];"
