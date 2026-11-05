@@ -1,0 +1,89 @@
+name: Tự Động Vietsub Video từ Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_blur:
+        type: boolean
+        description: 'Bật vệt mờ che sub gốc (Xuyên suốt video)'
+        default: false
+      sub_gap:
+        type: choice
+        description: 'Độ cao nâng sub Việt lên trên sub gốc'
+        options:
+          - '18 (Chuẩn thoáng đãng)'
+          - '12 (Gần sát sub gốc)'
+          - '25 (Cao hẳn lên trên)'
+        default: '18 (Chuẩn thoáng đãng)'
+      tag_name:
+        type: string
+        description: 'Tên thẻ Release cần làm (Để trống = Tự lấy bản mới nhất)'
+        default: ''
+
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài đặt Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cài đặt FFmpeg & Phông chữ
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk fonts-comfortaa fonts-roboto fontconfig
+          sudo fc-cache -fv
+
+      - name: Cài đặt thư viện Python
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Tự động tìm và tải video từ Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input_videos
+          TAG="${{ github.event.inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
+          fi
+          echo "TAG_NAME=$TAG" >> $GITHUB_ENV
+          echo "Đang xử lý Release có nhãn: $TAG"
+          gh release download "$TAG" --dir input_videos/ || true
+
+      - name: Chạy Script Vietsub & Lồng tiếng
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          INPUT_USE_BLUR: ${{ github.event.inputs.use_blur }}
+          INPUT_SUB_GAP: ${{ github.event.inputs.sub_gap }}
+        run: |
+          python run.py
+
+      - name: Đẩy video thành phẩm lên lại Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find output_videos/ -type f -size 0 -delete
+          if ls output_videos/*.mp4 1> /dev/null 2>&1; then
+            gh release upload "$TAG_NAME" output_videos/* --clobber
+            echo "Đã đẩy toàn bộ video lên Release thành công!"
+          else
+            echo "Không có video thành phẩm hợp lệ (> 0 bytes) để upload."
+            exit 1
+          fi
