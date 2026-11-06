@@ -13,7 +13,7 @@ print(f"[✓] Đã nạp thành công {len(API_KEYS)} Gemini API Key dự phòng
 CHANNEL_SUB_NAME = "IYaN AI"
 
 CONFIG = {
-    "models": ["gemini-3.6-flash"],
+    "models": ["gemini-3.5-flash"],
     "font_family": "Roboto",
     "font_size": 17,
     "outline_size": 2.6,
